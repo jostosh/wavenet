@@ -1,3 +1,5 @@
+import os
+
 import tensorflow as tf
 import numpy as np
 import argparse
@@ -20,6 +22,24 @@ class WaveNet:
                  dilation_stacks=2, dilation_pow2=5, learning_rate=1e-4, filter_width=2,
                  quantization_channels=256, skip_channels=512, dilation_channels=32,
                  residual_channels=32, global_condition=False, global_cond_depth=3):
+        """WaveNet model.
+        :param regularizer: Kernel regularizer.
+        :param regularize_coeff: Kernel regularizer coefficient.
+        :param dilation_stacks: Number of repeated dilation stacks. For example, if
+            dilation_pow2 equals 3, and dilation_stacks equals 2, the resulting dilations will be:
+            1, 2, 4, 1, 2, 4
+        :param dilation_pow2: How many powers of 2 to repeat. E.g. if it equals 4, it will repeat
+            dilations of 1, 2, 4 and 8
+        :param learning_rate: Learning rate of optimizer
+        :param filter_width: Width of causal convolution filters
+        :param quantization_channels: Number of quantization channels
+        :param skip_channels: Number of channels for skip connections
+        :param dilation_channels: Number of channels within dilation block (before going to skip
+            or residual)
+        :param residual_channels: Number of channels in residual connections
+        :param global_condition: Whether to use global conditioning
+        :param global_cond_depth: The number of classes for global conditioning
+        """
         self.layers = OrderedDict()
         self._regularizer = regularizer(regularize_coeff)
         self._dilations = np.repeat(2 ** np.arange(dilation_pow2), repeats=dilation_stacks)
@@ -33,6 +53,11 @@ class WaveNet:
         self._global_cond_depth = global_cond_depth
 
     def build(self, x, global_condition=None):
+        """Builds the network layers for an input x.
+        :param x: A Tensor containing one-hot the input of the WaveNet.
+        :param global_condition: Global condition input.
+        :return: Returns the logits for the quantized output.
+        """
         with tf.name_scope("Preprocess"):
             # Preprocess the incoming one-hot quantized representation
             current_out = self._causal_conv(
@@ -58,6 +83,13 @@ class WaveNet:
         return post_conv1
 
     def _causal_conv(self, x, filters, dilation_rate, name="CausalConv"):
+        """Builds a causal convolution.
+        :param x: The input for the convolution
+        :param filters: The number of filters in the convolution
+        :param dilation_rate: The dilation rate
+        :param name: Name of the layer
+        :return: Output of the layer for `x`
+        """
         if name not in self.layers:
             self.layers[name] = layers.Conv1D(
                 filters=filters, dilation_rate=(dilation_rate,), padding='causal', kernel_size=2,
@@ -65,12 +97,25 @@ class WaveNet:
         return self.layers[name](x)
 
     def _global_condition_layer(self, h, filters, name="GlobalContext"):
+        """Computes embedding for global condition.
+        :param h: Global condition input (a vector for each sample in the batch)
+        :param filters: The number of 'filters', i.e. the number of output units.
+        :param name: The name of the layer
+        :return: Output of the layer for `h`
+        """
         if name not in self.layers:
             self.layers[name] = layers.Dense(
                 units=filters, kernel_regularizer=self._regularizer, name=pth.basename(name))
         return tf.expand_dims(self.layers[name](h), axis=1)
 
     def _singular_conv(self, x, filters, name="SingularConv"):
+        """Computes a singular convolution, which uses kernel width of 1 (so padding algorithm
+        doesn't even matter).
+        :param x: The input of the layer
+        :param filters: The number of filters
+        :param name: The name of the layer
+        :return: Output of the layer for `x`
+        """
         if name not in self.layers:
             self.layers[name] = layers.Conv1D(
                 filters=filters, kernel_size=1, kernel_regularizer=self._regularizer,
@@ -79,35 +124,56 @@ class WaveNet:
 
     def dilation_block(self, x, dilation_rate, filters, residual_filters, skip_filters,
                        name="DilationBlock", h=None):
+        """Computes a dilation block consisting of 2 convolutions for its input sequence `x`. The
+        first is used for the 'candidate' output while the second convolution is used as a gate.
+        The gated output is then passed on (through convolutions) to a skip output (that skips all
+        the way to the layer after the dilation stacks) and a residual output.
+        :param x: The input sequence
+        :param dilation_rate: The dilation rates for the convolutions within this block
+        :param filters: The number of filters for the gated convolution output
+        :param residual_filters: The number of filters for the residual output
+        :param skip_filters: The number of filters for the skip connection output
+        :param name: The name of this block
+        :param h: An optional global condition vector (batched of course)
+        :return: The output of this dilation block
+        """
         with tf.name_scope(name):
             # Normal convolution and gate
-            conv_filter = self._causal_conv(x, filters=filters, dilation_rate=dilation_rate,
-                                            name=name + "/SequenceFilter")
-            conv_gate = self._causal_conv(x, filters=filters, dilation_rate=dilation_rate,
-                                          name=name + "/SequenceGate")
+            conv_gate_and_filter = self._causal_conv(
+                x, filters=filters * 2, dilation_rate=dilation_rate,
+                name=name + "/SequenceGateAndFilter")
+
             if h is not None:
-                # Add global conditions
-                conv_filter += self._global_condition_layer(
-                    h, filters=filters, name=name + "/GlobalConditionFilter")
-                conv_gate += self._global_condition_layer(
-                    h, filters=filters, name=name + "/GlobalConditionGate")
+                # Optionally add embedding of global condition
+                conv_gate_and_filter += self._global_condition_layer(
+                    h, filters=filters * 2, name=name + "/GlobalConditionGateAndFilter")
+
+            # Split the filters and compute gated output
+            conv_filter, conv_gate = tf.split(conv_gate_and_filter, num_or_size_splits=2, axis=2)
             gated_act = tf.nn.tanh(conv_filter) * tf.nn.sigmoid(conv_gate)  # Apply gate
 
-            # Compute residual (should have same as number of filters as x)
-            residual_out = self._singular_conv(
-                gated_act, filters=residual_filters, name=name + "/Residual")
-
-            # Compute skip output (should have same number of filters as all other skip outputs)
-            skip_out = self._singular_conv(
-                gated_act, filters=skip_filters, name=name + "/Skip")
+            # Compute residual (should have same as number of filters as x) and skip connections
+            residual_and_skip = self._singular_conv(
+                gated_act, filters=residual_filters + skip_filters, name=name + "/ResidualAndSkip")
+            residual_out, skip_out = tf.split(
+                residual_and_skip, num_or_size_splits=[residual_filters, skip_filters], axis=2)
 
             return skip_out, x + residual_out  # Return skip output and apply residuals
 
     def compile(self, sig_t0, sig_t1, global_cond, optimizer=tf.train.AdamOptimizer, mode='train'):
+        """Compiles the graph for a sequence starting at t=0 and its target (which starts at t=1).
+        :param sig_t0: Signal starting at t=0
+        :param sig_t1: Signal starting at t=1
+        :param global_cond: Global condition vector (batched)
+        :param optimizer: TensorFlow optimizer
+        :param mode: Either 'train' or 'test'
+        :return: Ops for: (i) the MLE prediction of the (quantized) signal, (ii) the cross entropy
+            loss, the (iii) logits and (iv) the mean squared error.
+        """
         logger.info("Compiling for mode '{}'".format(mode.title()))
         with tf.name_scope(mode.title()):
 
-            # Compute one-hot representation of signal at t = 0 and signal at t = 1
+            # Compute one-hot representation of mu_law(x) at t = 0 and mu_law(x) at t = 1
             sig_t0_mu_law = self.mu_law(sig_t0, one_hot=True, name="MuLawT0")
             sig_t1_mu_law = self.mu_law(sig_t1, one_hot=False, name="MuLawT1")
 
@@ -132,16 +198,26 @@ class WaveNet:
                 with tf.name_scope("Optimize"):
                     minimize = optimizer(learning_rate=self._lr).minimize(cross_entropy)
                 return prediction_signal, cross_entropy, minimize, logits, mse
-            elif mode != 'test':
-                raise ValueError("Unknown mode for WaveNet.compile, choose 'train' or 'test'")
         return prediction_signal, cross_entropy, logits, mse
 
     def loss(self, logits, labels):
+        """Computes mean cross entropy loss (summed within sequence and averaged over
+        all sequences).
+        :param logits: The output logits as given by the WaveNet
+        :param labels: The one-hot labels of the targets
+        :return: A Tensor containing the loss
+        """
         with tf.name_scope("Loss"):
             ce = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
             return tf.reduce_mean(tf.reduce_sum(ce, axis=-1))
 
     def mu_law(self, x, one_hot=True, name="MuLaw"):
+        """Computes 'forward' \mu-law where the output is quantized.
+        :param x: A batch of scalar sequences.
+        :param one_hot: Whether to return the output as onehot representation
+        :param name: Name of the computation
+        :return: A quantized \mu-law transformation of `x`
+        """
         with tf.name_scope(name):
             mu = tf.constant(self._quantization_channels - 1, dtype=tf.float32)
             transformed = tf.sign(x) * tf.nn.softplus(mu * tf.abs(x)) / tf.nn.softplus(mu)
@@ -151,6 +227,11 @@ class WaveNet:
             return out
 
     def mu_law_inverse(self, x_one_hot, name="MuLawInverse"):
+        """Computes the inverse \mu-law from a one-hot input sequence.
+        :param x_one_hot: A one-hot input sequence
+        :param name: Name of the computation
+        :return: The inverse \mu-law transform of `x_one_hot`
+        """
         with tf.name_scope(name):
             x = tf.gather(tf.to_float(
                 tf.linspace(-1.0, 1.0, self._quantization_channels)), indices=x_one_hot)
@@ -159,10 +240,13 @@ class WaveNet:
 
 
 def train(args):
-    # TODO add args
     wavenet = WaveNet(
         regularize_coeff=args.regularize_coeff, learning_rate=args.lr,
-        global_condition=args.global_cond)
+        global_condition=args.global_cond, dilation_stacks=args.dilation_stacks,
+        filter_width=args.filter_width, quantization_channels=args.quantization_channels,
+        dilation_channels=args.dilation_channels, global_cond_depth=args.global_cond_depth,
+        residual_channels=args.residual_channels, dilation_pow2=args.dilation_pow2,
+        skip_channels=args.skip_channels)
 
     # Load the data
     logger.info("Loading SimpleWaveForms data")
@@ -216,6 +300,8 @@ def train(args):
             # Train it
             logger.info("Current epoch: {}".format(str(epoch).zfill(
                 int(np.log10(args.num_epochs * 10)))))
+            if epoch == 0:
+                logger.info("First epoch, graph initialization will take some time.")
             pbar = tqdm.trange(train_steps, desc="Train")
             loss_avg, mse_avg = 0.0, 0.0
             for i in pbar:
@@ -233,6 +319,8 @@ def train(args):
 
             # Test it
             logger.info("Testing")
+            if epoch == 0:
+                logger.info("First epoch, graph initialization will take some time.")
             pbar = tqdm.trange(test_steps, desc="Test")
             loss_avg, mse_avg = 0.0, 0.0
             for i in pbar:
@@ -268,8 +356,18 @@ if __name__ == "__main__":
     parser.add_argument("--dilation_pow2", default=8, type=int)
     parser.add_argument("--dilation_stacks", default=4, type=int)
     parser.add_argument("--summary_interval", default=100, type=int)
+    parser.add_argument("--residual_channels", default=32, type=int)
+    parser.add_argument("--filter_width", default=2, type=int)
+    parser.add_argument("--dilation_channels", default=32, type=int)
+    parser.add_argument("--quantization_channels", default=256, type=int)
+    parser.add_argument("--skip_channels", default=512, type=int)
+    parser.add_argument("--global_cond_depth", default=3, type=int)
+    parser.add_argument("--tflogging", action="store_true", dest="tflogging")
     parser.add_argument('--global_cond', action="store_true", dest="global_cond")
-    parser.set_defaults(global_cond=False)
+    parser.set_defaults(global_cond=False, tflogging=False)
     args = parser.parse_args()
+
+    if not args.tflogging:
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     train(args)
