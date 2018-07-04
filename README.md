@@ -10,7 +10,7 @@ script.
 ## Code structure
 - `wavenet.py`: contains the model and training mechanism
 - `datasets.py`: contains a `SimpleWaveForm` dataset that generates sines, sawtooths and square waveforms.
-- `utils.py`: some non-relevant utilities
+- `util.py`: some non-relevant utilities
 
 ## Usage  
 The following invocation will at least produce some nice `TensorBoard` visualizations within a few epochs:
