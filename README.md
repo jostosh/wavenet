@@ -15,5 +15,5 @@ script.
 ## Usage  
 The following invocation will at least produce some nice `TensorBoard` visualizations within a few epochs:
 ```
-python wavenet.py --dilation_stacks 2 --dilation_pow2 5 --train_size 1000 --test_size 100 --sequence_len 10000 --global_cond
+python train.py --dilation_stacks 2 --dilation_pow2 5 --train_size 1000 --test_size 100 --sequence_len 10000 --global_cond
 ```
