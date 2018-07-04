@@ -8,7 +8,8 @@ The shape of the waveform can be included as global context by providing a `glob
 script. 
 
 ## Code structure
-- `wavenet.py`: contains the model and training mechanism
+- `train.py`: contains the code to setup the training
+- `wavenet.py`: contains the model
 - `datasets.py`: contains a `SimpleWaveForm` dataset that generates sines, sawtooths and square waveforms.
 - `util.py`: some non-relevant utilities
 
