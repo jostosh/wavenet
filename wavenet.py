@@ -36,7 +36,7 @@ class WaveNet:
         """
         self.layers = OrderedDict()
         self._regularizer = regularizer(regularize_coeff)
-        self._dilations = np.repeat(2 ** np.arange(dilation_pow2), repeats=dilation_stacks)
+        self._dilations = np.tile(2 ** np.arange(dilation_pow2), reps=dilation_stacks)
         self._lr = learning_rate
         self._filter_width = filter_width
         self._quantization_channels = quantization_channels
@@ -88,6 +88,8 @@ class WaveNet:
             self.layers[name] = layers.Conv1D(
                 filters=filters, dilation_rate=(dilation_rate,), padding='causal', kernel_size=2,
                 kernel_regularizer=self._regularizer, name=pth.basename(name))
+            logger.info("Adding {} with dilation rate {} and {} filters.".format(
+                name, dilation_rate, filters))
         return self.layers[name](x)
 
     def _global_condition_layer(self, h, filters, name="GlobalContext"):
@@ -100,6 +102,7 @@ class WaveNet:
         if name not in self.layers:
             self.layers[name] = layers.Dense(
                 units=filters, kernel_regularizer=self._regularizer, name=pth.basename(name))
+            logger.info("Adding {} with {} filters.".format(name, filters))
         return tf.expand_dims(self.layers[name](h), axis=1)
 
     def _singular_conv(self, x, filters, name="SingularConv"):
@@ -114,6 +117,7 @@ class WaveNet:
             self.layers[name] = layers.Conv1D(
                 filters=filters, kernel_size=1, kernel_regularizer=self._regularizer,
                 name=pth.basename(name))
+            logger.info("Adding {} with {} filters.".format(name, filters))
         return self.layers[name](x)
 
     def dilation_block(self, x, dilation_rate, filters, residual_filters, skip_filters,
